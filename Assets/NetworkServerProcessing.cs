@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 using System.IO;
+using System;
 
 static public class NetworkServerProcessing
 {
@@ -116,13 +117,43 @@ static public class NetworkServerProcessing
         else if (signifier == ClientToServerSignifiers.LeaveGameRoom)
         {
             string roomName = csv[1];
+
             if (gameRooms.ContainsKey(roomName))
             {
-                gameRooms[roomName].Remove(clientConnectionID);
-                if (gameRooms[roomName].Count == 0)
+                if (gameRooms[roomName].Contains(clientConnectionID))
+                {
+                    // A player is leaving, destroy the room and notify everyone
+                    Debug.Log($"Player {clientConnectionID} left room {roomName}. Destroying room.");
+
+                    // Notify all clients in the room to go back to GameRoomPanel
+                    foreach (int clientID in gameRooms[roomName])
+                    {
+                        SendMessageToClient($"{ServerToClientSignifiers.GameRoomDestroyed}", clientID, TransportPipeline.ReliableAndInOrder);
+                    }
+
+                    // Notify observers as well
+                    if (observers.ContainsKey(roomName))
+                    {
+                        foreach (int observerID in observers[roomName])
+                        {
+                            SendMessageToClient($"{ServerToClientSignifiers.GameRoomDestroyed}", observerID, TransportPipeline.ReliableAndInOrder);
+                        }
+                    }
+
+                    // Remove the room and its data
                     gameRooms.Remove(roomName);
+                    observers.Remove(roomName);
+                    gameBoards.Remove(roomName);
+                }
+                else if (observers.ContainsKey(roomName) && observers[roomName].Contains(clientConnectionID))
+                {
+                    // An observer is leaving, just remove them
+                    observers[roomName].Remove(clientConnectionID);
+                    Debug.Log($"Observer {clientConnectionID} left room {roomName}. No action required.");
+                }
             }
         }
+
         else if (signifier == ClientToServerSignifiers.SendMessageToOpponent)
         {
             string roomName = csv[1];
@@ -229,7 +260,6 @@ static public class NetworkServerProcessing
         SendMessageToClient($"{ServerToClientSignifiers.AccountList},{accountList}", clientConnectionID, TransportPipeline.ReliableAndInOrder);
     }
 
-
     static public void DisconnectionEvent(int clientConnectionID)
     {
         if (connectionToUsername.ContainsKey(clientConnectionID))
@@ -242,6 +272,56 @@ static public class NetworkServerProcessing
         {
             Debug.Log($"Client with ID {clientConnectionID} disconnected. No associated username.");
         }
+
+        // Remove client from any game room
+        foreach (var room in gameRooms)
+        {
+            if (room.Value.Contains(clientConnectionID))
+            {
+                Debug.Log($"Client {clientConnectionID} was in room {room.Key}. Removing and notifying others...");
+                room.Value.Remove(clientConnectionID);
+
+                // If there are no players left, destroy the room
+                if (room.Value.Count == 0)
+                {
+                    Debug.Log($"No players left in room {room.Key}. Destroying room.");
+                    gameRooms.Remove(room.Key);
+                    gameBoards.Remove(room.Key);
+                    currentTurn.Remove(room.Key);
+                }
+                else
+                {
+                    // Notify the remaining player(s) that the game is over
+                    foreach (int remainingClient in room.Value)
+                    {
+                        SendMessageToClient($"{ServerToClientSignifiers.GameRoomDestroyed}", remainingClient, TransportPipeline.ReliableAndInOrder);
+                    }
+                }
+                break;
+            }
+        }
+
+        // Remove client from observers
+        foreach (var observerList in observers.Values)
+        {
+            if (observerList.Contains(clientConnectionID))
+            {
+                Debug.Log($"Removing client {clientConnectionID} from observers.");
+                observerList.Remove(clientConnectionID);
+                break;
+            }
+        }
+    }
+
+    public static void ClearAllGameRoomData()
+    {
+        // Clear all game room-related data
+        gameRooms.Clear();
+        observers.Clear();
+        gameBoards.Clear();
+        currentTurn.Clear();
+
+        Debug.Log("Game room data cleared in NetworkServerProcessing.");
     }
 
     static public void SetGameLogic(GameLogic GameLogic)
@@ -302,7 +382,6 @@ static public class NetworkServerProcessing
         }
         else
         {
-            Debug.LogWarning($"Game board for room '{roomName}' already exists. Reinitializing.");
             gameBoards[roomName] = new int[3, 3]; // Reset board
         }
 
@@ -318,25 +397,16 @@ static public class NetworkServerProcessing
             return;
         }
 
-        Debug.Log($"Processing PlayerMove for Room {roomName} by Client {clientID}: x={x}, y={y}"); // Add this
+        Debug.Log($"Processing PlayerMove for Room {roomName} by Client {clientID}: x={x}, y={y}");
 
         int[,] board = gameBoards[roomName];
         int currentPlayer = currentTurn[roomName];
 
-        // Log the current board state before the move
-        Debug.Log($"Current board state for Room {roomName}:"); // Add this
-        for (int i = 0; i < 3; i++)
-        {
-            Debug.Log($"{board[i, 0]} {board[i, 1]} {board[i, 2]}");
-        }
-
-        // Ensure it's the correct player's turn and the cell is empty
         if (clientID == currentPlayer && board[x, y] == 0)
         {
-            int playerMark = (gameRooms[roomName].IndexOf(clientID) == 0) ? 1 : 2; // Player 1 = 1 (X), Player 2 = 2 (O)
+            int playerMark = (gameRooms[roomName].IndexOf(clientID) == 0) ? 1 : 2;
             board[x, y] = playerMark;
 
-            // Broadcast the move to all clients in the room
             foreach (int client in gameRooms[roomName])
             {
                 SendMessageToClient($"{ServerToClientSignifiers.PlayerMove},{x},{y},{playerMark}", client, TransportPipeline.ReliableAndInOrder);
@@ -350,33 +420,32 @@ static public class NetworkServerProcessing
                 }
             }
 
-            // Check for win/draw conditions
             if (CheckWinCondition(board, playerMark))
             {
                 foreach (int client in gameRooms[roomName])
                 {
-                    Debug.Log($"Player {playerMark} wins. Sending GameResult to Client {client}");
                     SendMessageToClient($"{ServerToClientSignifiers.GameResult},{playerMark}", client, TransportPipeline.ReliableAndInOrder);
                 }
+
+                NotifyRoomDestroyed(roomName);
                 ResetGameRoom(roomName);
             }
             else if (CheckDrawCondition(board))
             {
                 foreach (int client in gameRooms[roomName])
                 {
-                    Debug.Log($"Game Draw. Sending GameResult to Client {client}");
                     SendMessageToClient($"{ServerToClientSignifiers.GameResult},0", client, TransportPipeline.ReliableAndInOrder);
                 }
+
+                NotifyRoomDestroyed(roomName);
                 ResetGameRoom(roomName);
             }
             else
             {
-                // Switch turn
                 currentTurn[roomName] = gameRooms[roomName][1 - gameRooms[roomName].IndexOf(clientID)];
                 foreach (int client in gameRooms[roomName])
                 {
                     int isPlayerTurn = (client == currentTurn[roomName]) ? 1 : 0;
-                    Debug.Log($"Notifying Client {client} of turn update: IsPlayerTurn = {isPlayerTurn}");
                     SendMessageToClient($"{ServerToClientSignifiers.TurnUpdate},{isPlayerTurn}", client, TransportPipeline.ReliableAndInOrder);
                 }
             }
@@ -387,6 +456,24 @@ static public class NetworkServerProcessing
         }
     }
 
+    private static void NotifyRoomDestroyed(string roomName)
+    {
+        if (gameRooms.ContainsKey(roomName))
+        {
+            foreach (int client in gameRooms[roomName])
+            {
+                SendMessageToClient($"{ServerToClientSignifiers.GameRoomDestroyed}", client, TransportPipeline.ReliableAndInOrder);
+            }
+        }
+
+        if (observers.ContainsKey(roomName))
+        {
+            foreach (int observer in observers[roomName])
+            {
+                SendMessageToClient($"{ServerToClientSignifiers.GameRoomDestroyed}", observer, TransportPipeline.ReliableAndInOrder);
+            }
+        }
+    }
 
     private static bool CheckWinCondition(int[,] board, int player)
     {
@@ -474,4 +561,5 @@ public static class ServerToClientSignifiers
     public const int TurnUpdate = 13; // New signifier for turn updates
 
     public const int BoardStateUpdate = 15; // Sending board state to observer
+    public const int GameRoomDestroyed = 16; // New signifier for destroyed rooms
 }
